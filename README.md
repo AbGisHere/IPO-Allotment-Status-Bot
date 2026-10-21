@@ -1,6 +1,6 @@
 # IPO Allotment Status Bot
 
-[![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/AbGisHere/IPO-Allotment-Status-Bot/releases/tag/v1.0.0)
+[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/AbGisHere/IPO-Allotment-Status-Bot/releases/tag/v1.1.0)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Telegram Bot](https://img.shields.io/badge/Telegram-Bot-26A5E4.svg?logo=telegram&logoColor=white)](https://core.telegram.org/bots)
@@ -91,14 +91,19 @@ Set these in `.env`, or as environment variables:
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | (required) | Token from @BotFather |
 | `FAST_INTERVAL` | `30` | Seconds between checks once a watched IPO's BoA date has arrived |
-| `SLOW_INTERVAL` | `300` | Seconds between checks when nothing is due yet |
+| `FAST_FROM_HOUR` | `15` | On the BoA date, check every 30 min before this hour (0–23) and every `FAST_INTERVAL` from it |
+| `DAILY_CHECK_HOUR` | `9` | Hour of the day (0–23, local time) for the single daily check while nothing is due yet |
 
 ## How it works
 
 - **Calendar:** IPO names, dates and statuses come from Investorgain's live IPO table. Each IPO's registrar comes from its detail page and is cached in `state.json`.
 - **MUFG Intime:** the company dropdown comes from `IPO.aspx/GetDetails`. Results come from `IPO.aspx/SearchOnPan`, using the AES-encrypted token the page itself generates.
 - **KFintech:** the company list is hardcoded in the site's JS bundle (`main.<hash>.js`). The bot downloads the bundle again only when the hash changes. Results come from the site's own API, with the PAN and client ID sent as headers.
-- **Polling:** every 30s once a watched IPO's BoA date has arrived, and every 5 min otherwise. When an IPO first appears on a registrar, its data sometimes isn't uploaded yet. In that case the bot keeps retrying "not found" PANs for up to 3 hours.
+- **Polling:** registrar checks follow the BoA dates. Telegram commands always respond instantly, whatever the schedule.
+  - **Before a watched IPO's BoA date:** one check a day at `DAILY_CHECK_HOUR` (9 AM). Each check also re-reads the calendar, and the bot messages you if a BoA date has moved.
+  - **On the BoA date:** every 30 min until `FAST_FROM_HOUR` (3 PM), then every `FAST_INTERVAL` (30s) until it's out, overnight included. Results usually come out in the evening, roughly 5–10 PM, but some come out earlier and some late at night.
+  - **After the BoA date, if it still isn't out:** every 30s. An IPO watched by keyword has no BoA date, so it's always treated as due.
+  - **Every 2 min:** while the bot is retrying "no record yet" PANs, or `/all on` is set. When an IPO first appears on a registrar, its data sometimes isn't uploaded yet, so "not found" PANs are retried for up to 3 hours.
 
 ## Project structure
 

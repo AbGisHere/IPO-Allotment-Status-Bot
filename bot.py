@@ -12,7 +12,7 @@ Configure with TELEGRAM_BOT_TOKEN (env var or .env file next to this script).
 See HELP_TEXT below / send /help to the bot for commands.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import json
 import os
@@ -25,13 +25,16 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 STATE_FILE = HERE / "state.json"
-FAST_INTERVAL = int(os.environ.get("FAST_INTERVAL", "30"))   # a watched IPO's BoA date has arrived
-SLOW_INTERVAL = int(os.environ.get("SLOW_INTERVAL", "300"))  # nothing due yet
+FAST_INTERVAL = int(os.environ.get("FAST_INTERVAL", "30"))      # a watched IPO's BoA date has arrived
+DAILY_CHECK_HOUR = int(os.environ.get("DAILY_CHECK_HOUR", "9"))  # nothing due: one check a day at this hour
+FAST_FROM_HOUR = int(os.environ.get("FAST_FROM_HOUR", "15"))     # on the BoA date, go fast from this hour
+EARLY_INTERVAL = 1800  # on the BoA date before FAST_FROM_HOUR (allotments rarely come out that early)
+RETRY_INTERVAL = 120  # retrying "no record yet" PANs, or /all on
 STATUS_RETRY_SECS = 3 * 3600  # keep retrying "record not found" PANs this long after allotment goes live
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -412,6 +415,7 @@ def check_registrars(state, tg):
         state["seen"][reg] = list(companies)
 
     retry_missing_pans(state, tg)
+    refresh_boa_dates(state, tg)
     save_state(state)
     return "\n".join(summary) or "Nothing to check (watchlist empty — try /select)."
 
@@ -430,11 +434,48 @@ def retry_missing_pans(state, tg):
                     + "\n".join(lines))
 
 
-def next_interval(state):
-    today = date.today().isoformat()
-    due = any(not w.get("found") and (not w.get("boa") or w["boa"] <= today) for w in state["watchlist"])
-    retrying = any(w.get("retry_pans") for w in state["watchlist"])
-    return FAST_INTERVAL if due else (120 if retrying or state["notify_all"] else SLOW_INTERVAL)
+def refresh_boa_dates(state, tg):
+    """BoA dates can move (e.g. an issue gets extended); re-read the calendar every few hours."""
+    pending = [w for w in state["watchlist"] if not w.get("found") and w.get("boa")]
+    if not pending:
+        return
+    try:
+        ipos = {i["name"]: i for i in fetch_ipos(max_age=6 * 3600)}
+    except Exception as e:
+        log("calendar refresh failed:", e)
+        return
+    for w in pending:
+        new = ipos.get(w["name"], {}).get("boa")
+        if new and new != w["boa"]:
+            log(f"BoA date for {w['name']} moved {w['boa']} -> {new}")
+            if state["owner_chat_id"]:
+                tg.send(state["owner_chat_id"], f"📆 <b>{esc(w['name'])}</b>: allotment date moved "
+                                                f"from {w['boa']} to <b>{new}</b>.")
+            w["boa"] = new
+
+
+def next_check_at(state):
+    """Timestamp of the next registrar check for the pending watchlist:
+      - overdue (BoA date passed), unknown BoA date, or BoA date after FAST_FROM_HOUR: FAST_INTERVAL
+      - BoA date before FAST_FROM_HOUR: every EARLY_INTERVAL until FAST_FROM_HOUR
+      - otherwise: once a day at DAILY_CHECK_HOUR, or midnight of the next BoA date if sooner"""
+    now = datetime.now()
+    today = now.date().isoformat()
+    pending = [w for w in state["watchlist"] if not w.get("found")]
+    if any(not w.get("boa") or w["boa"] < today for w in pending):
+        return now.timestamp() + FAST_INTERVAL
+    fast_from = now.replace(hour=FAST_FROM_HOUR, minute=0, second=0, microsecond=0)
+    if any(w["boa"] == today for w in pending):
+        if now >= fast_from:
+            return now.timestamp() + FAST_INTERVAL
+        return min(now + timedelta(seconds=EARLY_INTERVAL), fast_from).timestamp()
+    daily = now.replace(hour=DAILY_CHECK_HOUR, minute=0, second=0, microsecond=0)
+    if daily <= now:
+        daily += timedelta(days=1)
+    candidates = [daily] + [datetime.fromisoformat(w["boa"]) for w in pending]
+    if state["notify_all"] or any(w.get("retry_pans") for w in state["watchlist"]):
+        candidates.append(now + timedelta(seconds=RETRY_INTERVAL))
+    return min(candidates).timestamp()
 
 
 # ---------------------------------------------------------------- commands
@@ -689,7 +730,8 @@ def main():
                 check_registrars(state, tg)
             except Exception as e:
                 log("check error:", e)
-            next_check = time.time() + next_interval(state)
+            next_check = next_check_at(state)
+            log("next check:", datetime.fromtimestamp(next_check).strftime("%a %d %b %H:%M:%S"))
         try:
             wait = max(1, min(25, int(next_check - time.time())))
             res = tg.call("getUpdates", offset=state["tg_offset"], timeout=wait)
@@ -699,6 +741,7 @@ def main():
                 msg = upd.get("message") or {}
                 if msg.get("text", "").startswith("/"):
                     handle_command(state, tg, msg["chat"]["id"], msg["text"], msg.get("message_id"))
+                    next_check = min(next_check, next_check_at(state))  # e.g. /select of a due IPO
         except Exception as e:
             log("telegram error:", e)
             time.sleep(10)
