@@ -1,6 +1,6 @@
 # IPO Allotment Status Bot
 
-[![Version](https://img.shields.io/badge/version-1.1.0-blue.svg)](https://github.com/AbGisHere/IPO-Allotment-Status-Bot/releases/tag/v1.1.0)
+[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](https://github.com/AbGisHere/IPO-Allotment-Status-Bot/releases/tag/v1.2.0)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Telegram Bot](https://img.shields.io/badge/Telegram-Bot-26A5E4.svg?logo=telegram&logoColor=white)](https://core.telegram.org/bots)
@@ -14,12 +14,19 @@ A Telegram bot that tells you as soon as an Indian IPO's allotment goes live, an
 - 🎉 **Auto status check**: when an allotment goes live, it checks your saved PANs and says whether you got shares
 - 🔍 **`/status TONBO`**: checks allotment for all your saved PANs whenever you ask
 
+- 🔔 **Mac and phone notifications** (optional): a macOS banner and/or a phone push via the free [ntfy](https://ntfy.sh) app, turned on from Telegram with `/notify`
+
 Supported registrars:
 
-| Registrar | Site |
-|---|---|
-| MUFG Intime (formerly Link Intime) | https://in.mpms.mufg.com/Initial_Offer/public-issues.html |
-| KFintech | https://ipostatus.kfintech.com |
+| Registrar | Go-live alert | PAN status check | Site |
+|---|:-:|:-:|---|
+| MUFG Intime (formerly Link Intime) | ✅ | ✅ | https://in.mpms.mufg.com/Initial_Offer/public-issues.html |
+| KFintech | ✅ | ✅ | https://ipostatus.kfintech.com |
+| Bigshare Services | ✅ | ✅ | https://ipo.bigshareonline.com/IPO_Status.html |
+| Maashitla Securities | ✅ | ✅ | https://maashitla.com/allotment-status/public-issues |
+| Purva Sharegistry | ✅ | ✅ | https://www.purvashare.com/investor-service/ipo-query |
+| Skyline Financial Services | ✅ | ✅ | https://www.skylinerta.com/ipo.php |
+| Cameo Corporate Services | ✅ | ❌ (captcha) | https://ipostatus1.cameoindia.com/ |
 
 ## Requirements
 
@@ -65,6 +72,10 @@ Then open your bot in Telegram and send `/start`. **The first chat to do this be
 | `/status [name]` | Allotment result for every saved PAN |
 | `/check` | Poll the registrars right now |
 | `/all on` / `/all off` | Also alert on every new allotment, not just watched ones |
+| `/notify` | Show which Mac / phone notifications are on |
+| `/notify mac on` / `off` | macOS notification (with sound) when an allotment is out |
+| `/notify phone on` / `off` | Phone push via the free ntfy app. The bot replies with a private topic to subscribe to. |
+| `/notify test` | Send a test notification |
 | `/clear` | Delete every message in the chat. Telegram limits bots to messages from the last 48 hours. |
 | `/help` | Show all commands |
 
@@ -83,6 +94,13 @@ Your allotment
 • Me (ABxxxxx34F): 🎉 Allotted 21 of 21 shares (Retail)
 ```
 
+## Notifications outside Telegram
+
+Telegram already notifies your phone, but you can also get alerts that don't depend on it. Both are off by default, are turned on from the bot, and fire only when an allotment is out.
+
+- **Mac:** `/notify mac on`. Uses macOS's built-in notifications (`osascript`), so there's nothing to install. If no banner appears, allow notifications for **Script Editor** in System Settings → Notifications.
+- **Phone:** `/notify phone on`, then install [ntfy](https://ntfy.sh) (App Store / Play Store, no account needed) and subscribe to the topic the bot sends you. Anyone who knows the topic name can read its messages, so keep it private. The pushes never include your PAN, only the label you gave it. `/notify phone off` retires the topic.
+
 ## Configuration
 
 Set these in `.env`, or as environment variables:
@@ -93,12 +111,16 @@ Set these in `.env`, or as environment variables:
 | `FAST_INTERVAL` | `30` | Seconds between checks once a watched IPO's BoA date has arrived |
 | `FAST_FROM_HOUR` | `15` | On the BoA date, check every 30 min before this hour (0–23) and every `FAST_INTERVAL` from it |
 | `DAILY_CHECK_HOUR` | `9` | Hour of the day (0–23, local time) for the single daily check while nothing is due yet |
+| `NTFY_SERVER` | `https://ntfy.sh` | ntfy server for phone pushes, if you self-host one |
 
 ## How it works
 
 - **Calendar:** IPO names, dates and statuses come from Investorgain's live IPO table. Each IPO's registrar comes from its detail page and is cached in `state.json`.
 - **MUFG Intime:** the company dropdown comes from `IPO.aspx/GetDetails`. Results come from `IPO.aspx/SearchOnPan`, using the AES-encrypted token the page itself generates.
 - **KFintech:** the company list is hardcoded in the site's JS bundle (`main.<hash>.js`). The bot downloads the bundle again only when the hash changes. Results come from the site's own API, with the PAN and client ID sent as headers.
+- **Bigshare, Purva, Skyline, Cameo:** the company list is the dropdown on each site's lookup page. Bigshare results come from its `Data.aspx/FetchIpodetails` endpoint; Purva and Skyline submit the page's own form (with its CSRF token) and read the result table.
+- **Maashitla:** the company list and results come from the JSON API its site uses.
+- A company only appears on a registrar's list once its allotment is out, which is what triggers the alert.
 - **Polling:** registrar checks follow the BoA dates. Telegram commands always respond instantly, whatever the schedule.
   - **Before a watched IPO's BoA date:** one check a day at `DAILY_CHECK_HOUR` (9 AM). Each check also re-reads the calendar, and the bot messages you if a BoA date has moved.
   - **On the BoA date:** every 30 min until `FAST_FROM_HOUR` (3 PM), then every `FAST_INTERVAL` (30s) until it's out, overnight included. Results usually come out in the evening, roughly 5–10 PM, but some come out earlier and some late at night.
@@ -119,16 +141,18 @@ state.json          # created at runtime: watchlist, PANs, caches (gitignored)
 - PANs are stored only in your local `state.json`, which is gitignored and never leaves your machine, except when the bot sends them to the registrar to look up your allotment.
 - The bot deletes your `/pan` message from the chat after saving it, and masks PANs in every reply.
 - The bot replies only to its owner's chat.
+- Phone pushes (if you turn them on) go through ntfy and contain only the IPO name and your PAN labels, never a PAN.
 
 ## Limitations
 
-- IPOs handled by other registrars (Bigshare, Purva, Skyline, Cameo, Maashitla, and so on) appear in `/upcoming` marked ⚠️, but the bot can't monitor them yet.
+- IPOs handled by other registrars (Mudra RTA, Integrated Registry, and so on) appear in `/upcoming` marked ⚠️, but the bot can't monitor them yet.
+- Cameo's lookup needs an image captcha, so for Cameo IPOs the bot alerts you when allotment is out and links to the site, but can't check your PAN.
 - It relies on unofficial website endpoints, so if a site changes its page, that part may break.
 - It only runs while the host machine is awake.
 
 ## Disclaimer
 
-This project isn't affiliated with or endorsed by MUFG Intime, KFin Technologies, Investorgain, NSE, BSE or SEBI. It's for personal use, to check your own allotment status. Always confirm results on the registrar's official website. The software is provided as is, without warranty. See [LICENSE](LICENSE).
+This project isn't affiliated with or endorsed by MUFG Intime, KFin Technologies, Bigshare, Maashitla, Purva Sharegistry, Skyline, Cameo, Investorgain, ntfy, NSE, BSE or SEBI. It's for personal use, to check your own allotment status. Always confirm results on the registrar's official website. The software is provided as is, without warranty. See [LICENSE](LICENSE).
 
 ## License
 

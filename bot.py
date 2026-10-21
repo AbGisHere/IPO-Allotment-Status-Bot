@@ -6,17 +6,25 @@ Data sources:
   - Investorgain live IPO table (upcoming/open/closed IPOs, BoA dates, registrar)
   - MUFG Intime (formerly Link Intime): https://in.mpms.mufg.com/Initial_Offer/public-issues.html
   - KFintech:                           https://ipostatus.kfintech.com
+  - Bigshare:                           https://ipo.bigshareonline.com/IPO_Status.html
+  - Maashitla:                          https://maashitla.com/allotment-status/public-issues
+  - Purva Sharegistry:                  https://www.purvashare.com/investor-service/ipo-query
+  - Skyline:                            https://www.skylinerta.com/ipo.php
+  - Cameo (go-live alerts only; PAN lookups need a captcha): https://ipostatus1.cameoindia.com/
 
 Stdlib only (+ the system `openssl` binary for MUFG's token encryption).
 Configure with TELEGRAM_BOT_TOKEN (env var or .env file next to this script).
 See HELP_TEXT below / send /help to the bot for commands.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
+import html
+from http.client import HTTPSConnection  # (`http` is our helper function below)
 import json
 import os
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -47,9 +55,21 @@ MUFG_PAGE = MUFG_BASE + "public-issues.html"
 MUFG_KEY = b"8080808080808080"  # AES key/IV hardcoded in MUFG's page JS
 KFIN_PAGE = "https://ipostatus.kfintech.com/"
 KFIN_API = "https://0uz601ms56.execute-api.ap-south-1.amazonaws.com/prod/api/query"
+BIGSHARE_PAGE = "https://ipo.bigshareonline.com/IPO_Status.html"
+BIGSHARE_API = "https://ipo.bigshareonline.com/Data.aspx/FetchIpodetails"
+MAASHITLA_PAGE = "https://maashitla.com/allotment-status/public-issues"
+MAASHITLA_LIST = "https://api.maashitla.com/api/company-directory"
+MAASHITLA_API = "https://pnjbvxj6md.execute-api.ap-south-1.amazonaws.com/prod/check/"
+PURVA_PAGE = "https://www.purvashare.com/investor-service/ipo-query"
+SKYLINE_PAGE = "https://www.skylinerta.com/ipo.php"
+SKYLINE_FORM = "https://www.skylinerta.com/display_application.php"
+CAMEO_PAGE = "https://ipostatus1.cameoindia.com/"
+NTFY_SERVER = os.environ.get("NTFY_SERVER", "https://ntfy.sh")
 
 MUFG, KFIN = "MUFG Intime", "KFintech"
-REGISTRAR_URLS = {MUFG: MUFG_PAGE, KFIN: KFIN_PAGE}
+BIGSHARE, MAASHITLA, PURVA, SKYLINE, CAMEO = "Bigshare", "Maashitla", "Purva Sharegistry", "Skyline", "Cameo"
+REGISTRAR_URLS = {MUFG: MUFG_PAGE, KFIN: KFIN_PAGE, BIGSHARE: BIGSHARE_PAGE, MAASHITLA: MAASHITLA_PAGE,
+                  PURVA: PURVA_PAGE, SKYLINE: SKYLINE_PAGE, CAMEO: CAMEO_PAGE}
 STATUS_LABELS = {"U": "Upcoming", "O": "Open", "CT": "Closing today", "C": "Closed"}
 
 PAN_RE = re.compile(r"^[A-Z]{5}[0-9]{4}[A-Z]$")
@@ -60,7 +80,7 @@ HELP_TEXT = """🤖 <b>IPO Allotment Bot</b>
 /upcoming — upcoming, open and closed IPOs with their allotment (BoA) date and registrar
 
 <b>Allotment alerts</b>
-/select &lt;name&gt; — watch an IPO, e.g. <code>/select TONBO</code>. I work out its registrar (MUFG Intime or KFintech) and message you the moment allotment goes live
+/select &lt;name&gt; — watch an IPO, e.g. <code>/select TONBO</code>. I work out its registrar (MUFG Intime, KFintech, Bigshare, Maashitla, Purva, Skyline or Cameo) and message you the moment allotment goes live
 /unselect &lt;name&gt; — stop watching
 /list — what you're watching
 /check — check the registrars right now
@@ -76,6 +96,12 @@ HELP_TEXT = """🤖 <b>IPO Allotment Bot</b>
 
 When a watched IPO goes live I check your PANs automatically and tell you if you got shares.
 
+<b>Notifications outside Telegram</b> (optional)
+/notify — show what's on
+/notify mac on|off — macOS notification when allotment is out
+/notify phone on|off — phone push via the free ntfy app
+/notify test — send a test notification
+
 <i>Name matching is fuzzy: "tonbo", "TONBO" or "Tonbo Imaging" all work.</i>"""
 
 BOT_COMMANDS = [
@@ -87,6 +113,7 @@ BOT_COMMANDS = [
     ("pan", "Add/list PANs: /pan ABCDE1234F"),
     ("check", "Check registrars now"),
     ("all", "Alert on every new allotment: on|off"),
+    ("notify", "Mac / phone notifications: on|off"),
     ("clear", "Clear this chat"),
     ("help", "How to use this bot"),
 ]
@@ -106,10 +133,42 @@ def log(*args):
     print(time.strftime("[%Y-%m-%d %H:%M:%S]"), *args, flush=True)
 
 
-def http(url, data=None, headers=None, timeout=30):
+def http(url, data=None, headers=None, timeout=30, opener=None):
     req = urllib.request.Request(url, data=data, headers={"User-Agent": UA, **(headers or {})})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with (opener or urllib.request.build_opener()).open(req, timeout=timeout) as r:
         return r.read().decode("utf-8", errors="replace")
+
+
+def with_retry(fn):
+    """Call fn(), backing off on rate limits / transient server errors. 404 -> None."""
+    for attempt in range(4):
+        try:
+            return fn()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return None
+            if e.code in (429, 500, 502, 503, 504) and attempt < 3:
+                time.sleep(2 * 2 ** attempt)
+                continue
+            raise
+
+
+def cookie_session():
+    """Opener that keeps cookies, for sites with CSRF-protected forms."""
+    return urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+
+
+def html_text(s):
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", s))).strip()
+
+
+def html_options(page, select_id):
+    """{value: label} for a <select> on a page (skipping the placeholder)."""
+    m = re.search(r'<select[^>]*\b(?:id|name)="%s"[^>]*>(.*?)</select>' % select_id, page, re.S | re.I)
+    if not m:
+        raise RuntimeError(f"couldn't find the company list (#{select_id})")
+    opts = re.findall(r'<option[^>]*value="([^"]*)"[^>]*>(.*?)</option>', m.group(1), re.S | re.I)
+    return {v.strip(): html_text(n) for v, n in opts if v.strip() not in ("", "0")}
 
 
 def norm(name):
@@ -187,6 +246,10 @@ def registrar_key(registrar_name):
         return KFIN
     if "mufg" in n or "link intime" in n:
         return MUFG
+    for key, word in ((BIGSHARE, "bigshare"), (MAASHITLA, "maashitla"), (PURVA, "purva"),
+                      (SKYLINE, "skyline"), (CAMEO, "cameo")):
+        if word in n:
+            return key
     return None
 
 
@@ -226,7 +289,22 @@ def fetch_kfin():
     return _kfin_cache["companies"]
 
 
-COMPANY_FETCHERS = {MUFG: fetch_mufg, KFIN: fetch_kfin}
+def fetch_maashitla():
+    data = json.loads(http(MAASHITLA_LIST, headers={"Origin": "https://maashitla.com"}))
+    return {c["company_slug"]: c["company_name"].strip() for c in data["companies"]}
+
+
+# The rest list their companies in a <select> on the lookup page. Like MUFG and KFintech,
+# a company only appears there once its allotment is out.
+COMPANY_FETCHERS = {
+    MUFG: fetch_mufg,
+    KFIN: fetch_kfin,
+    BIGSHARE: lambda: html_options(http(BIGSHARE_PAGE), "ddlCompany"),
+    MAASHITLA: fetch_maashitla,
+    PURVA: lambda: html_options(http(PURVA_PAGE), "company_id"),
+    SKYLINE: lambda: html_options(http(SKYLINE_PAGE), "company"),
+    CAMEO: lambda: html_options(http(CAMEO_PAGE), "drpCompany"),
+}
 
 
 def match_company(name, companies):
@@ -266,19 +344,27 @@ def status_mufg(cid, pan):
             "name": rows[0].findtext("NAME1", "").strip()}
 
 
+def _kfin_get(url, headers):
+    """KFintech's API reads header names case-sensitively (`client_id` works, `Client_Id`
+    gets a 502), and urllib always title-cases them, so talk to it with http.client."""
+    u = urllib.parse.urlsplit(url)
+    conn = HTTPSConnection(u.netloc, timeout=30)
+    try:
+        conn.request("GET", f"{u.path}?{u.query}", headers={"User-Agent": UA, **headers})
+        r = conn.getresponse()
+        body = r.read().decode("utf-8", errors="replace")
+    finally:
+        conn.close()
+    if r.status >= 400:
+        raise urllib.error.HTTPError(url, r.status, r.reason, r.headers, None)
+    return body
+
+
 def status_kfin(cid, pan):
     headers = {"reqparam": pan, "client_id": cid, "Origin": KFIN_PAGE.rstrip("/"), "Referer": KFIN_PAGE}
-    for attempt in range(4):
-        try:
-            body = http(KFIN_API + "?type=pan", headers=headers)
-            break
-        except urllib.error.HTTPError as e:
-            if e.code == 404:
-                return None
-            if e.code in (429, 500, 502, 503, 504) and attempt < 3:
-                time.sleep(2 * 2 ** attempt)
-                continue
-            raise
+    body = with_retry(lambda: _kfin_get(KFIN_API + "?type=pan", headers))
+    if body is None:
+        return None
     data = json.loads(body)
     rows = data.get("data", data) if isinstance(data, dict) else data
     rows = rows if isinstance(rows, list) else [rows]
@@ -290,7 +376,112 @@ def status_kfin(cid, pan):
             "name": str(rows[0].get("Name", "")).strip()}
 
 
-STATUS_FETCHERS = {MUFG: status_mufg, KFIN: status_kfin}
+def _int(v):
+    digits = re.sub(r"[^\d]", "", str(v or "").split(".")[0])
+    return int(digits) if digits else 0
+
+
+def status_bigshare(cid, pan):
+    body = json.dumps({"Applicationno": "", "Company": cid, "SelectionType": "PN", "PanNo": pan,
+                       "txtcsdl": "", "txtDPID": "", "txtClId": "", "ddlType": "0", "lang": "en"}).encode()
+    res = with_retry(lambda: http(BIGSHARE_API, data=body, headers={
+        "Content-Type": "application/json; charset=utf-8", "Referer": BIGSHARE_PAGE}))
+    d = json.loads(res)["d"]
+    if d.get("Status") == "NOTFOUND":
+        return None
+    if d.get("Status") not in (None, "", "OK"):
+        raise RuntimeError(f"Bigshare: {d.get('Message') or d['Status']}")
+    rows = d.get("Records") or [d]
+    return {"applied": sum(_int(r.get("APPLIED")) for r in rows),
+            "allotted": sum(_int(r.get("ALLOTED")) for r in rows),
+            "category": "", "name": str(d.get("Name", "")).strip()}
+
+
+def status_maashitla(cid, pan):
+    url = MAASHITLA_API + urllib.parse.quote(cid) + "?" + urllib.parse.urlencode({"pan": pan})
+    body = with_retry(lambda: http(url, headers={"Origin": "https://maashitla.com"}))
+    data = json.loads(body) if body else {}
+    if data.get("name") is None:
+        return None
+    return {"applied": _int(data.get("shares_applied")), "allotted": _int(data.get("shares_allotted")),
+            "category": "", "name": str(data["name"]).strip()}
+
+
+def _summarize(records, registrar):
+    """Turn scraped {heading: value} records into a status dict. Purva and Skyline render
+    results as HTML, so look columns up by keyword rather than exact heading."""
+    def find(rec, *wants, avoid=()):
+        for want in wants:  # most specific pattern first
+            for k, v in rec.items():
+                k = k.lower()
+                if re.search(want, k) and not any(re.search(a, k) for a in avoid):
+                    return v
+        return None
+
+    qty = r"(share|qty|quantity)"
+    allotted = lambda r: find(r, rf"allot.*{qty}|{qty}.*allot", r"allot", avoid=(r"date", r"basis", r"status"))
+    applied = lambda r: find(r, rf"appl.*{qty}|{qty}.*appl|^applied", r"appl|bid",
+                             avoid=(r"allot", r"name", r"appl\w*\.?\s*(no|num)", r"\bid\b"))
+    hits = [r for r in records if allotted(r) is not None]
+    if not hits:
+        raise RuntimeError(f"{registrar}: couldn't read the result page")
+    return {"applied": sum(_int(applied(r)) for r in hits),
+            "allotted": sum(_int(allotted(r)) for r in hits),
+            "category": (find(hits[0], r"categ") or "").strip(),
+            "name": (find(hits[0], r"name") or "").strip()}
+
+
+def status_purva(cid, pan):
+    s = cookie_session()
+    token = re.search(r'name="csrfmiddlewaretoken" value="([^"]+)"', http(PURVA_PAGE, opener=s))
+    if not token:
+        raise RuntimeError("Purva: couldn't find the form token")
+    form = urllib.parse.urlencode({"csrfmiddlewaretoken": token.group(1), "company_id": cid,
+                                   "applicationNumber": "", "panNumber": pan}).encode()
+    page = http(PURVA_PAGE, data=form, headers={"Referer": PURVA_PAGE}, opener=s)
+    if re.search(r"no record found", page, re.I):
+        return None
+    table = re.search(r'<table[^>]*results-table.*?</table>', page, re.S)
+    if not table:
+        raise RuntimeError("Purva: couldn't read the result page")
+    heads = [html_text(h) for h in re.findall(r"<th[^>]*>(.*?)</th>", table.group(0), re.S)]
+    records, pairs = [], {}
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", table.group(0), re.S):
+        ths = [html_text(c) for c in re.findall(r"<th[^>]*>(.*?)</th>", tr, re.S)]
+        tds = [html_text(c) for c in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
+        if len(ths) == 1 and len(tds) == 1:  # vertical layout: one heading/value per row
+            pairs[ths[0]] = tds[0]
+        elif tds:
+            records.append(dict(zip(heads, tds)))
+    return _summarize(records or [pairs], PURVA)
+
+
+def status_skyline(cid, pan):
+    s = cookie_session()
+    form_page = http(SKYLINE_FORM, data=urllib.parse.urlencode({"company": cid}).encode(),
+                     headers={"Referer": SKYLINE_PAGE}, opener=s)
+    token = re.search(r'name="csrf_token"[^>]*value="([^"]+)"', form_page)
+    if not token:
+        raise RuntimeError("Skyline: couldn't find the form token")
+    form = urllib.parse.urlencode({"client_id": "", "application_no": "", "pan": pan,
+                                   "csrf_token": token.group(1), "company": cid, "action": "search"}).encode()
+    page = http(SKYLINE_FORM, data=form, headers={"Referer": SKYLINE_FORM}, opener=s)
+    if re.search(r"no record found", page, re.I):
+        return None
+    block = re.search(r'class="[^"]*resultsec.*?(?=<form|<footer)', page, re.S)
+    if not block:
+        raise RuntimeError("Skyline: couldn't read the result page")
+    pairs = {}
+    for li in re.findall(r"<li[^>]*>(.*?)</li>", block.group(0), re.S):
+        parts = [html_text(p) for p in re.split(r"<[^>]+>", li) if html_text(p)]
+        if len(parts) >= 2:
+            pairs[parts[0].rstrip(":")] = " ".join(parts[1:])
+    return _summarize([pairs], SKYLINE)
+
+
+# Cameo's lookup needs an image captcha, so it only gets go-live alerts.
+STATUS_FETCHERS = {MUFG: status_mufg, KFIN: status_kfin, BIGSHARE: status_bigshare,
+                   MAASHITLA: status_maashitla, PURVA: status_purva, SKYLINE: status_skyline}
 
 
 def format_status(label, res):
@@ -303,13 +494,57 @@ def format_status(label, res):
     return f"• {who}: 😞 Not allotted (applied {res['applied']}){cat}"
 
 
+def short_status(p, res):
+    """One-line plain-text result for Mac/phone notifications. Never includes the PAN:
+    ntfy topics are readable by anyone who knows the name."""
+    who = p.get("label") or "You"
+    if res is None:
+        return f"{who}: no application found"
+    if res["allotted"] > 0:
+        return f"🎉 {who}: allotted {res['allotted']} shares"
+    return f"😞 {who}: not allotted"
+
+
+# ---------------------------------------------------------------- notifications (Mac / phone)
+
+def mac_notify(title, body):
+    script = ['on run argv', 'display notification (item 2 of argv) with title (item 1 of argv) '
+              'sound name "Glass"', 'end run']
+    subprocess.run(["osascript", *sum((["-e", line] for line in script), []), title, body],
+                   capture_output=True, timeout=15, check=True)
+
+
+def phone_notify(topic, title, body, url=None):
+    msg = {"topic": topic, "title": title, "message": body, "priority": 5, "tags": ["rotating_light"]}
+    if url:
+        msg["click"] = url
+    http(NTFY_SERVER, data=json.dumps(msg).encode(), headers={"Content-Type": "application/json"}, timeout=15)
+
+
+def push(state, title, body, url=None):
+    """Send to whichever of Mac / phone the owner turned on with /notify. Best effort."""
+    n = state["notify"]
+    if n.get("mac"):
+        try:
+            mac_notify(title, body)
+        except Exception as e:
+            log("mac notification failed:", e)
+    if n.get("phone"):
+        try:
+            phone_notify(n["phone"], title, body, url)
+        except Exception as e:
+            log("phone notification failed:", e)
+
+
 # ---------------------------------------------------------------- state
 
 def load_state():
+    state = {"owner_chat_id": None, "watchlist": [], "pans": [], "notify_all": False,
+             "seen": {}, "registrar_cache": {}, "tg_offset": 0}
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {"owner_chat_id": None, "watchlist": [], "pans": [], "notify_all": False,
-            "seen": {}, "registrar_cache": {}, "tg_offset": 0}
+        state.update(json.loads(STATE_FILE.read_text()))
+    state.setdefault("notify", {"mac": False, "phone": None})
+    return state
 
 
 def save_state(state):
@@ -344,11 +579,17 @@ class Telegram:
 
 # ---------------------------------------------------------------- core
 
+def no_lookup_line(reg):
+    return (f"{reg}'s lookup needs a captcha, so I can't check PANs there. "
+            f"Check yours here: {REGISTRAR_URLS[reg]}")
+
+
 def check_statuses(state, item, pans, final=False):
-    """Check allotment for `pans` on a found item. Returns (lines, pans_still_not_found)."""
+    """Check allotment for `pans` on a found item.
+    Returns (lines, pans_still_not_found, short plain-text results for push notifications)."""
     found = item["found"]
     fetch = STATUS_FETCHERS[found["registrar"]]
-    lines, missing = [], []
+    lines, missing, short = [], [], []
     for p in pans:
         try:
             res = fetch(found["cid"], p["pan"])
@@ -360,7 +601,8 @@ def check_statuses(state, item, pans, final=False):
             missing.append(p)
         else:
             lines.append(format_status(pan_label(p), res))
-    return lines, missing
+            short.append(short_status(p, res))
+    return lines, missing, short
 
 
 def check_registrars(state, tg):
@@ -394,16 +636,23 @@ def check_registrars(state, tg):
             log(f"ALLOTMENT LIVE: {cname} on {reg}")
             msg = (f"🚨 <b>Allotment is out!</b>\n\n<b>{esc(cname)}</b>\n"
                    f"Registrar: {reg}\n{REGISTRAR_URLS[reg]}")
-            if state["pans"]:
-                lines, missing = check_statuses(state, w, state["pans"])
+            short = []
+            if reg not in STATUS_FETCHERS:
+                msg += "\n\n" + esc(no_lookup_line(reg))
+                short = ["Check your status on the registrar's site."]
+            elif state["pans"]:
+                lines, missing, short = check_statuses(state, w, state["pans"])
                 w["retry_pans"] = [p["pan"] for p in missing]
                 if missing:
                     lines.append(f"• {len(missing)} PAN(s): no record yet. I'll keep checking.")
+                    short.append(f"{len(missing)} PAN(s): no record yet")
                 msg += "\n\n<b>Your allotment</b>\n" + "\n".join(lines)
             else:
                 msg += "\n\nAdd a PAN with /pan to have me check if you got it."
             if chat:
                 tg.send(chat, msg)
+            push(state, f"🚨 Allotment out: {cname}", "\n".join(short) or f"Registrar: {reg}",
+                 REGISTRAR_URLS[reg])
 
         seen = set(state["seen"].get(reg, []))
         if state["notify_all"] and reg in state["seen"]:  # never alert on the first-ever fetch
@@ -412,6 +661,7 @@ def check_registrars(state, tg):
                 if cid not in seen and cid not in watched and chat:
                     tg.send(chat, f"🆕 New allotment live: <b>{esc(cname)}</b>\n"
                                   f"Registrar: {reg}\n{REGISTRAR_URLS[reg]}")
+                    push(state, f"🆕 Allotment out: {cname}", f"Registrar: {reg}", REGISTRAR_URLS[reg])
         state["seen"][reg] = list(companies)
 
     retry_missing_pans(state, tg)
@@ -427,11 +677,14 @@ def retry_missing_pans(state, tg):
             continue
         final = time.time() - w["found"]["at"] > STATUS_RETRY_SECS
         pans = [p for p in state["pans"] if p["pan"] in w["retry_pans"]]
-        lines, missing = check_statuses(state, w, pans, final=final)
+        lines, missing, short = check_statuses(state, w, pans, final=final)
         w["retry_pans"] = [p["pan"] for p in missing]
         if lines and state["owner_chat_id"]:
             tg.send(state["owner_chat_id"], f"<b>{esc(w['found']['name'])}</b> — allotment update\n"
                     + "\n".join(lines))
+        if short:
+            push(state, f"{w['found']['name']}: allotment update", "\n".join(short),
+                 REGISTRAR_URLS[w["found"]["registrar"]])
 
 
 def refresh_boa_dates(state, tg):
@@ -502,7 +755,8 @@ def cmd_upcoming(state, tg, chat_id, arg):
             out.append(f"{mark}<b>{esc(ipo['name'])}</b>{sme}\n"
                        f"   {ipo['open']}–{ipo['close']} · Allotment <b>{esc(ipo['boa_label'])}</b>"
                        f" · Lists {esc(ipo['listing'])}\n   Registrar: {esc(reg)}{tracked}")
-    out.append("\n/select &lt;name&gt; to get alerted.  ⚠️ = registrar I can't monitor yet.")
+    out.append("\n/select &lt;name&gt; to get alerted.  ⚠️ = registrar I can't monitor yet."
+               "\n(Cameo IPOs get go-live alerts only: its site needs a captcha to check a PAN.)")
     tg.send(chat_id, "\n".join(out))
 
 
@@ -536,7 +790,7 @@ def cmd_select(state, tg, chat_id, arg):
         return tg.send(chat_id, f"Already watching <b>{esc(item['name'])}</b>.")
     if item["registrar_full"] and not item["registrar"]:
         return tg.send(chat_id, f"<b>{esc(item['name'])}</b>'s registrar is {esc(item['registrar_full'])}, "
-                                f"which I can't monitor yet (only MUFG Intime and KFintech).")
+                                f"which I can't monitor yet (I support {', '.join(COMPANY_FETCHERS)}).")
     state["watchlist"].append(item)
     save_state(state)
 
@@ -544,9 +798,11 @@ def cmd_select(state, tg, chat_id, arg):
         msg = (f"👀 Watching <b>{esc(item['name'])}</b>\nRegistrar: {item['registrar']}\n"
                f"Allotment expected: {esc(item['boa'] or '?')}")
     else:
-        msg = (f"👀 Watching for “{esc(item['name'])}” on MUFG Intime and KFintech "
+        msg = (f"👀 Watching for “{esc(item['name'])}” on every registrar I support "
                f"(it isn't on the IPO calendar, so I'll match the name as-is).")
-    if not state["pans"]:
+    if item["registrar"] and item["registrar"] not in STATUS_FETCHERS:
+        msg += f"\n\nI'll alert you when it's out, but {esc(no_lookup_line(item['registrar']))}"
+    elif not state["pans"]:
         msg += "\n\nTip: add your PAN with /pan so I can tell you if you got shares."
     tg.send(chat_id, msg)
     check_registrars(state, tg)
@@ -569,7 +825,7 @@ def cmd_list(state, tg, chat_id, arg):
     lines = []
     for w in state["watchlist"]:
         st = f"✅ out on {w['found']['registrar']}" if w.get("found") else f"⏳ expected {w.get('boa') or '?'}"
-        lines.append(f"• <b>{esc(w['name'])}</b> ({w.get('registrar') or 'both registrars'}) — {st}")
+        lines.append(f"• <b>{esc(w['name'])}</b> ({w.get('registrar') or 'all registrars'}) — {st}")
     tg.send(chat_id, "<b>Watching</b>\n" + "\n".join(lines)
             + ("\n\nAlso alerting on IPOs you haven't selected (/all off to stop)." if state["notify_all"]
                else "\n\nOnly alerting on the IPOs above (/all on to also get every other IPO)."))
@@ -604,7 +860,11 @@ def cmd_status(state, tg, chat_id, arg):
             tg.send(chat_id, f"⏳ <b>{esc(w['name'])}</b>: allotment isn't out yet"
                              + (f" (expected {esc(w['boa'])})." if w.get("boa") else "."))
             continue
-        lines, _ = check_statuses(state, w, state["pans"], final=True)
+        if w["found"]["registrar"] not in STATUS_FETCHERS:
+            tg.send(chat_id, f"✅ <b>{esc(w['found']['name'])}</b>: allotment is out. "
+                             + esc(no_lookup_line(w["found"]["registrar"])))
+            continue
+        lines, _, _ = check_statuses(state, w, state["pans"], final=True)
         tg.send(chat_id, f"<b>{esc(w['found']['name'])}</b> ({w['found']['registrar']})\n" + "\n".join(lines))
     save_state(state)
 
@@ -650,6 +910,52 @@ def cmd_all(state, tg, chat_id, arg):
     tg.send(chat_id, f"Alert on every new allotment: {arg.lower()}")
 
 
+def cmd_notify(state, tg, chat_id, arg):
+    n = state["notify"]
+    parts = arg.lower().split()
+    if parts == ["test"]:
+        if not (n.get("mac") or n.get("phone")):
+            return tg.send(chat_id, "Nothing to test: turn one on with /notify mac on or /notify phone on.")
+        push(state, "🧪 IPO Allotment Bot", "Test notification. Allotment alerts will look like this.")
+        return tg.send(chat_id, "Sent a test notification.")
+    if len(parts) != 2 or parts[0] not in ("mac", "phone") or parts[1] not in ("on", "off"):
+        mac = "on" if n.get("mac") else "off"
+        phone = "on" if n.get("phone") else "off"
+        return tg.send(chat_id, f"<b>Notifications outside Telegram</b>\nMac: {mac}\nPhone: {phone}\n\n"
+                                "Only sent when an allotment is out.\n"
+                                "/notify mac on|off · /notify phone on|off · /notify test")
+    device, on = parts[0], parts[1] == "on"
+
+    if device == "mac":
+        if on and sys.platform != "darwin":
+            return tg.send(chat_id, "Mac notifications only work when the bot runs on a Mac.")
+        n["mac"] = on
+        save_state(state)
+        if not on:
+            return tg.send(chat_id, "Mac notifications off.")
+        try:
+            mac_notify("🧪 IPO Allotment Bot", "Mac notifications are on.")
+        except Exception as e:
+            return tg.send(chat_id, f"⚠️ Turned on, but the test notification failed: {esc(str(e))[:150]}")
+        return tg.send(chat_id, "🖥 Mac notifications on. You should have just got a test one.\n\n"
+                                "Didn't see it? Open System Settings → Notifications → Script Editor "
+                                "and allow notifications.")
+
+    if not on:
+        n["phone"] = None  # a fresh topic is made next time, so the old one goes dead
+        save_state(state)
+        return tg.send(chat_id, "Phone notifications off.")
+    n["phone"] = n.get("phone") or "ipo-" + secrets.token_hex(10)
+    save_state(state)
+    tg.send(chat_id, f"📱 <b>Phone notifications on</b>\n\n"
+                     f"1. Install the free <b>ntfy</b> app (App Store / Play Store)\n"
+                     f"2. Tap <b>+</b> and subscribe to this topic:\n<code>{n['phone']}</code>\n"
+                     f"   (or open {NTFY_SERVER}/{n['phone']} on your phone)\n"
+                     f"3. Send /notify test to check it works\n\n"
+                     f"Keep the topic name private: anyone who knows it can read these pushes. "
+                     f"They never include your PAN.")
+
+
 def cmd_clear(state, tg, chat_id, arg, message_id=None):
     """Bots can't list chat history, but message ids in a private chat are sequential,
     so delete every id from the last clear up to this /clear (deleteMessages skips gaps)."""
@@ -670,7 +976,7 @@ COMMANDS = {
     "/upcoming": cmd_upcoming, "/select": cmd_select, "/add": cmd_select,
     "/unselect": cmd_unselect, "/remove": cmd_unselect, "/list": cmd_list,
     "/status": cmd_status, "/pan": cmd_pan, "/check": cmd_check, "/all": cmd_all,
-    "/clear": cmd_clear,
+    "/notify": cmd_notify, "/clear": cmd_clear,
 }
 
 
