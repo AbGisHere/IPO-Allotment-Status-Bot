@@ -1,0 +1,32 @@
+# Secrets & personal data (bot token, saved PANs)
+.env
+state.json
+state.tmp
+bot.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# AI agent / assistant files
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+.cursor/
+.cursorrules
+.aider*
+.copilot/
+.github/copilot-instructions.md
+.windsurf/
+.windsurfrules
+.codex/
+.gemini/
+GEMINI.md
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
