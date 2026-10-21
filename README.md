@@ -1,6 +1,6 @@
 # IPO Allotment Status Bot
 
-[![Version](https://img.shields.io/badge/version-1.2.1-blue.svg)](https://github.com/AbGisHere/IPO-Allotment-Status-Bot/releases/tag/v1.2.1)
+[![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)](https://github.com/AbGisHere/IPO-Allotment-Status-Bot/releases/tag/v1.3.0)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Telegram Bot](https://img.shields.io/badge/Telegram-Bot-26A5E4.svg?logo=telegram&logoColor=white)](https://core.telegram.org/bots)
@@ -13,6 +13,7 @@ A Telegram bot that tells you as soon as an Indian IPO's allotment goes live, an
 - 👀 **`/select TONBO`**: works out the registrar and alerts you as soon as allotment goes live
 - 🎉 **Auto status check**: when an allotment goes live, it checks your saved PANs and says whether you got shares
 - 🔍 **`/status TONBO`**: checks allotment for all your saved PANs whenever you ask
+- 💼 **`/portfolio`**: once an IPO's results are in, it moves off `/list` into your portfolio, showing what each PAN got
 
 - 🔔 **Mac and phone notifications** (optional): a macOS banner and/or a phone push via the free [ntfy](https://ntfy.sh) app, turned on from Telegram with `/notify`
 
@@ -70,6 +71,8 @@ Then open your bot in Telegram and send `/start`. **The first chat to do this be
 | `/pan` | List saved PANs (masked) |
 | `/pan remove <PAN or label>` | Delete a saved PAN |
 | `/status [name]` | Allotment result for every saved PAN |
+| `/portfolio` | IPOs whose allotment is out, with each PAN's result. An IPO moves here from `/list` once every PAN has a result. |
+| `/portfolio remove <name>` | Delete an IPO from the portfolio |
 | `/check` | Poll the registrars right now |
 | `/all on` / `/all off` | Also alert on every new allotment, not just watched ones |
 | `/notify` | Show which Mac / phone notifications are on |
@@ -134,6 +137,7 @@ Set these in `.env`, or as environment variables:
   - **On the BoA date:** every 30 min until `FAST_FROM_HOUR` (3 PM), then every `FAST_INTERVAL` (30s) until it's out, overnight included. Results usually come out in the evening, roughly 5–10 PM, but some come out earlier and some late at night.
   - **After the BoA date, if it still isn't out:** every 30s. An IPO watched by keyword has no BoA date, so it's always treated as due.
   - **Every 2 min:** while the bot is retrying "no record yet" PANs, or `/all on` is set. When an IPO first appears on a registrar, its data sometimes isn't uploaded yet, so "not found" PANs are retried for up to 3 hours.
+- **Portfolio:** each PAN's result (shares applied, allotted and category) is saved with the IPO. Once no PANs are left to retry, the IPO moves from the watchlist to the portfolio, so it stops being polled. `/status <name>` re-checks it and updates the saved result.
 
 ## Project structure
 
@@ -141,12 +145,12 @@ Set these in `.env`, or as environment variables:
 bot.py              # the bot (single file, stdlib only)
 install_launchd.sh  # macOS background service installer
 .env.example        # config template
-state.json          # created at runtime: watchlist, PANs, caches (gitignored)
+state.json          # created at runtime: watchlist, portfolio, PANs, caches (gitignored)
 ```
 
 ## Privacy
 
-- PANs are stored only in your local `state.json`, which is gitignored and never leaves your machine, except when the bot sends them to the registrar to look up your allotment.
+- PANs and allotment results are stored only in your local `state.json`, which is gitignored and never leaves your machine, except when the bot sends them to the registrar to look up your allotment.
 - The bot deletes your `/pan` message from the chat after saving it, and masks PANs in every reply.
 - The bot replies only to its owner's chat.
 - Phone pushes (if you turn them on) go through ntfy and contain only the IPO name and your PAN labels, never a PAN.

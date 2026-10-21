@@ -17,7 +17,7 @@ Configure with TELEGRAM_BOT_TOKEN (env var or .env file next to this script).
 See HELP_TEXT below / send /help to the bot for commands.
 """
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 import html
 from http.client import HTTPSConnection  # (`http` is our helper function below)
@@ -95,6 +95,11 @@ HELP_TEXT = """🤖 <b>IPO Allotment Bot</b>
 /status — check every watched IPO that's out
 
 When a watched IPO goes live I check your PANs automatically and tell you if you got shares.
+Once every PAN has a result, the IPO moves from /list to /portfolio.
+
+<b>Portfolio</b>
+/portfolio — IPOs whose allotment is out, with what each PAN got
+/portfolio remove &lt;name&gt; — delete one
 
 <b>Notifications outside Telegram</b> (optional)
 /notify — show what's on
@@ -110,6 +115,7 @@ BOT_COMMANDS = [
     ("unselect", "Stop watching an IPO"),
     ("list", "Show watched IPOs"),
     ("status", "Did I get allotment? /status TONBO"),
+    ("portfolio", "IPOs that are out + what you got"),
     ("pan", "Add/list PANs: /pan ABCDE1234F"),
     ("check", "Check registrars now"),
     ("all", "Alert on every new allotment: on|off"),
@@ -545,6 +551,7 @@ def load_state():
     if STATE_FILE.exists():
         state.update(json.loads(STATE_FILE.read_text()))
     state.setdefault("notify", {"mac": False, "phone": None})
+    state.setdefault("portfolio", [])
     return state
 
 
@@ -603,6 +610,8 @@ def check_statuses(state, item, pans, final=False):
         else:
             lines.append(format_status(pan_label(p), res))
             short.append(short_status(p, res))
+            item.setdefault("results", {})[p["pan"]] = res and {
+                k: res[k] for k in ("applied", "allotted", "category")}
     return lines, missing, short
 
 
@@ -650,6 +659,8 @@ def check_registrars(state, tg):
                 msg += "\n\n<b>Your allotment</b>\n" + "\n".join(lines)
             else:
                 msg += "\n\nAdd a PAN with /pan to have me check if you got it."
+            if not w.get("retry_pans"):
+                msg += "\n\nMoved from /list to /portfolio."
             if chat:
                 tg.send(chat, msg)
             push(state, f"🚨 Allotment out: {cname}", "\n".join(short) or f"Registrar: {reg}",
@@ -666,6 +677,7 @@ def check_registrars(state, tg):
         state["seen"][reg] = list(companies)
 
     retry_missing_pans(state, tg)
+    archive_finished(state)
     refresh_boa_dates(state, tg)
     save_state(state)
     return "\n".join(summary) or "Nothing to check (watchlist empty — try /select)."
@@ -682,10 +694,18 @@ def retry_missing_pans(state, tg):
         w["retry_pans"] = [p["pan"] for p in missing]
         if lines and state["owner_chat_id"]:
             tg.send(state["owner_chat_id"], f"<b>{esc(w['found']['name'])}</b> — allotment update\n"
-                    + "\n".join(lines))
+                    + "\n".join(lines) + ("" if missing else "\n\nMoved from /list to /portfolio."))
         if short:
             push(state, f"{w['found']['name']}: allotment update", "\n".join(short),
                  REGISTRAR_URLS[w["found"]["registrar"]])
+
+
+def archive_finished(state):
+    """Move watched IPOs that are out, with no PANs left to retry, into the portfolio."""
+    for w in [w for w in state["watchlist"] if w.get("found") and not w.get("retry_pans")]:
+        state["watchlist"].remove(w)
+        state["portfolio"].append(w)
+        log(f"moved to portfolio: {w['found']['name']}")
 
 
 def refresh_boa_dates(state, tg):
@@ -787,6 +807,8 @@ def cmd_select(state, tg, chat_id, arg):
     else:  # not on the calendar: fall back to watching a raw keyword on both registrars
         item = {"name": arg, "registrar": None, "registrar_full": None, "boa": None, "found": None}
 
+    if any(norm(w["name"]) == norm(item["name"]) for w in state["portfolio"]):
+        return tg.send(chat_id, f"<b>{esc(item['name'])}</b>'s allotment is already out. See /portfolio.")
     if any(norm(w["name"]) == norm(item["name"]) for w in state["watchlist"]):
         return tg.send(chat_id, f"Already watching <b>{esc(item['name'])}</b>.")
     if item["registrar_full"] and not item["registrar"]:
@@ -822,7 +844,8 @@ def cmd_unselect(state, tg, chat_id, arg):
 
 def cmd_list(state, tg, chat_id, arg):
     if not state["watchlist"]:
-        return tg.send(chat_id, "Not watching anything. Try /upcoming then /select &lt;name&gt;.")
+        return tg.send(chat_id, "Not watching anything. Try /upcoming then /select &lt;name&gt;."
+                       + ("\nIPOs whose allotment is out are in /portfolio." if state["portfolio"] else ""))
     lines = []
     for w in state["watchlist"]:
         st = f"✅ out on {w['found']['registrar']}" if w.get("found") else f"⏳ expected {w.get('boa') or '?'}"
@@ -837,7 +860,7 @@ def cmd_status(state, tg, chat_id, arg):
         return tg.send(chat_id, "Add a PAN first: /pan ABCDE1234F")
     if arg:
         q = norm(arg)
-        items = [w for w in state["watchlist"] if q in norm(w["name"])]
+        items = [w for w in state["watchlist"] + state["portfolio"] if q in norm(w["name"])]
         if not items:  # not watched: look it up on the fly
             ipos = find_ipos(arg, fetch_ipos())
             if len(ipos) == 1:
@@ -848,7 +871,8 @@ def cmd_status(state, tg, chat_id, arg):
     else:
         items = [w for w in state["watchlist"] if w.get("found")]
         if not items:
-            return tg.send(chat_id, "None of your watched IPOs are out yet. Use /status &lt;name&gt;.")
+            return tg.send(chat_id, "None of your watched IPOs are out yet. Use /status &lt;name&gt;."
+                           + ("\nResults for ones already out are in /portfolio." if state["portfolio"] else ""))
 
     for w in items:
         if not w.get("found"):  # check whether it has gone live since the last poll
@@ -897,6 +921,33 @@ def cmd_pan(state, tg, chat_id, arg, message_id=None):
             pass
     tg.send(chat_id, f"🔐 Saved {esc(pan_label({'pan': pan, 'label': label}))}. "
                      f"(I deleted your message so the PAN isn't left in the chat.)")
+
+
+def cmd_portfolio(state, tg, chat_id, arg):
+    if arg.lower().startswith("remove"):
+        q = norm(arg[6:])
+        keep = [w for w in state["portfolio"] if not (q and q in norm(w["name"]))]
+        removed = [w["found"]["name"] for w in state["portfolio"] if w not in keep]
+        state["portfolio"] = keep
+        save_state(state)
+        return tg.send(chat_id, f"Removed from portfolio: {esc(', '.join(removed))}" if removed
+                       else "Usage: /portfolio remove &lt;name&gt;")
+    if not state["portfolio"]:
+        return tg.send(chat_id, "Portfolio is empty. Watched IPOs land here once their allotment is out.")
+    labels = {p["pan"]: pan_label(p) for p in state["pans"]}
+    out, got = ["💼 <b>Portfolio</b>"], 0
+    for w in sorted(state["portfolio"], key=lambda w: w["found"]["at"], reverse=True):
+        f, results = w["found"], w.get("results", {})
+        got += any(r and r["allotted"] > 0 for r in results.values())
+        out.append(f"\n<b>{esc(f['name'])}</b>\n   {f['registrar']} · out "
+                   + time.strftime("%d %b %Y", time.localtime(f["at"])))
+        if f["registrar"] not in STATUS_FETCHERS:
+            out.append(f"   Can't check PANs here (captcha): {REGISTRAR_URLS[f['registrar']]}")
+        elif not results:
+            out.append(f"   No PANs checked yet. Try /status {esc(w['name'])}")
+        out += ["   " + format_status(labels.get(pan, mask_pan(pan)), r) for pan, r in results.items()]
+    out.append(f"\n🎉 Got shares in {got} of {len(state['portfolio'])} IPO(s).")
+    tg.send(chat_id, "\n".join(out))
 
 
 def cmd_check(state, tg, chat_id, arg):
@@ -976,7 +1027,7 @@ def cmd_clear(state, tg, chat_id, arg, message_id=None):
 COMMANDS = {
     "/upcoming": cmd_upcoming, "/select": cmd_select, "/add": cmd_select,
     "/unselect": cmd_unselect, "/remove": cmd_unselect, "/list": cmd_list,
-    "/status": cmd_status, "/pan": cmd_pan, "/check": cmd_check, "/all": cmd_all,
+    "/status": cmd_status, "/portfolio": cmd_portfolio, "/pan": cmd_pan, "/check": cmd_check, "/all": cmd_all,
     "/notify": cmd_notify, "/clear": cmd_clear,
 }
 
