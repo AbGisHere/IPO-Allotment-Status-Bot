@@ -17,7 +17,7 @@ Configure with TELEGRAM_BOT_TOKEN (env var or .env file next to this script).
 See HELP_TEXT below / send /help to the bot for commands.
 """
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 import html
 from http.client import HTTPSConnection  # (`http` is our helper function below)
@@ -500,9 +500,10 @@ def short_status(p, res):
     who = p.get("label") or "You"
     if res is None:
         return f"{who}: no application found"
+    of = f" of {res['applied']}" if res["applied"] else ""
     if res["allotted"] > 0:
-        return f"🎉 {who}: allotted {res['allotted']} shares"
-    return f"😞 {who}: not allotted"
+        return f"🎉 {who}: allotted {res['allotted']}{of} shares"
+    return f"😞 {who}: not allotted (0{of})"
 
 
 # ---------------------------------------------------------------- notifications (Mac / phone)

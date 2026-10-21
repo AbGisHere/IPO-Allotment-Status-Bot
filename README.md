@@ -1,6 +1,6 @@
 # IPO Allotment Status Bot
 
-[![Version](https://img.shields.io/badge/version-1.2.0-blue.svg)](https://github.com/AbGisHere/IPO-Allotment-Status-Bot/releases/tag/v1.2.0)
+[![Version](https://img.shields.io/badge/version-1.2.1-blue.svg)](https://github.com/AbGisHere/IPO-Allotment-Status-Bot/releases/tag/v1.2.1)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Telegram Bot](https://img.shields.io/badge/Telegram-Bot-26A5E4.svg?logo=telegram&logoColor=white)](https://core.telegram.org/bots)
@@ -100,6 +100,14 @@ Telegram already notifies your phone, but you can also get alerts that don't dep
 
 - **Mac:** `/notify mac on`. Uses macOS's built-in notifications (`osascript`), so there's nothing to install. If no banner appears, allow notifications for **Script Editor** in System Settings → Notifications.
 - **Phone:** `/notify phone on`, then install [ntfy](https://ntfy.sh) (App Store / Play Store, no account needed) and subscribe to the topic the bot sends you. Anyone who knows the topic name can read its messages, so keep it private. The pushes never include your PAN, only the label you gave it. `/notify phone off` retires the topic.
+
+Each notification has one line per saved PAN, for example:
+
+```
+🚨 Allotment out: TONBO IMAGING INDIA LIMITED
+🎉 Me: allotted 21 of 21 shares
+😞 Mom: not allotted (0 of 42)
+```
 
 ## Configuration
 
