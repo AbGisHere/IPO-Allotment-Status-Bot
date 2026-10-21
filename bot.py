@@ -17,8 +17,9 @@ Configure with TELEGRAM_BOT_TOKEN (env var or .env file next to this script).
 See HELP_TEXT below / send /help to the bot for commands.
 """
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
+import difflib
 import html
 from http.client import HTTPSConnection  # (`http` is our helper function below)
 import json
@@ -260,8 +261,14 @@ def registrar_key(registrar_name):
 
 
 def find_ipos(query, ipos):
+    """Items whose name contains `query`; if none, allow a typo per word ('Bonfigioli')."""
     q = norm(query)
-    return [i for i in ipos if q and q in norm(i["name"])]
+    hits = [i for i in ipos if q and q in norm(i["name"])]
+    words = [norm(x) for x in query.split() if len(norm(x)) >= 4]
+    if hits or not words:
+        return hits
+    return [i for i in ipos if all(difflib.get_close_matches(x, [norm(y) for y in i["name"].split()], 1, 0.8)
+                                   for x in words)]
 
 
 # ---------------------------------------------------------------- registrars: company lists
@@ -859,15 +866,14 @@ def cmd_status(state, tg, chat_id, arg):
     if not state["pans"]:
         return tg.send(chat_id, "Add a PAN first: /pan ABCDE1234F")
     if arg:
-        q = norm(arg)
-        items = [w for w in state["watchlist"] + state["portfolio"] if q in norm(w["name"])]
+        items = find_ipos(arg, state["watchlist"] + state["portfolio"])
         if not items:  # not watched: look it up on the fly
             ipos = find_ipos(arg, fetch_ipos())
             if len(ipos) == 1:
                 reg = registrar_key(fetch_registrar(state, ipos[0]["slug"]))
                 items = [{"name": ipos[0]["name"], "registrar": reg, "boa": ipos[0]["boa"], "found": None}]
-            else:
-                items = [{"name": arg, "registrar": None, "boa": None, "found": None}]
+            else:  # not on the calendar either: search every registrar for it
+                items = [{"name": arg, "registrar": None, "boa": None, "found": None, "query": True}]
     else:
         items = [w for w in state["watchlist"] if w.get("found")]
         if not items:
@@ -881,6 +887,10 @@ def cmd_status(state, tg, chat_id, arg):
                 if hit:
                     w["found"] = {"registrar": reg, "cid": hit[0], "name": hit[1], "at": time.time()}
                     break
+        if not w.get("found") and w.get("query"):
+            tg.send(chat_id, f"❓ No IPO matching <b>{esc(w['name'])}</b>. Check the spelling, "
+                             "or see /list and /upcoming.")
+            continue
         if not w.get("found"):
             tg.send(chat_id, f"⏳ <b>{esc(w['name'])}</b>: allotment isn't out yet"
                              + (f" (expected {esc(w['boa'])})." if w.get("boa") else "."))
@@ -889,7 +899,16 @@ def cmd_status(state, tg, chat_id, arg):
             tg.send(chat_id, f"✅ <b>{esc(w['found']['name'])}</b>: allotment is out. "
                              + esc(no_lookup_line(w["found"]["registrar"])))
             continue
-        lines, _, _ = check_statuses(state, w, state["pans"], final=True)
+        watched = w in state["watchlist"]
+        retrying = watched and time.time() - w["found"]["at"] < STATUS_RETRY_SECS
+        lines, missing, _ = check_statuses(state, w, state["pans"], final=not retrying)
+        if watched:  # counts as a retry: PANs found now stop being retried
+            w["retry_pans"] = [p["pan"] for p in missing]
+            if missing:
+                lines.append(f"• {len(missing)} PAN(s): no record yet. I'll keep checking.")
+            archive_finished(state)
+            if w in state["portfolio"]:
+                lines.append("\nMoved from /list to /portfolio.")
         tg.send(chat_id, f"<b>{esc(w['found']['name'])}</b> ({w['found']['registrar']})\n" + "\n".join(lines))
     save_state(state)
 

@@ -1,6 +1,6 @@
 # IPO Allotment Status Bot
 
-[![Version](https://img.shields.io/badge/version-1.3.0-blue.svg)](https://github.com/AbGisHere/IPO-Allotment-Status-Bot/releases/tag/v1.3.0)
+[![Version](https://img.shields.io/badge/version-1.3.1-blue.svg)](https://github.com/AbGisHere/IPO-Allotment-Status-Bot/releases/tag/v1.3.1)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9%2B-3776AB.svg?logo=python&logoColor=white)](https://www.python.org/)
 [![Telegram Bot](https://img.shields.io/badge/Telegram-Bot-26A5E4.svg?logo=telegram&logoColor=white)](https://core.telegram.org/bots)
@@ -64,13 +64,13 @@ Then open your bot in Telegram and send `/start`. **The first chat to do this be
 | Command | What it does |
 |---|---|
 | `/upcoming` | Upcoming, open and closed IPOs, with BoA date and registrar |
-| `/select <name>` | Watch an IPO. Matching is fuzzy, so `tonbo`, `TONBO` and `Tonbo Imaging` all work. |
+| `/select <name>` | Watch an IPO. Matching is fuzzy, so `tonbo`, `TONBO`, `Tonbo Imaging` and small typos like `Tonbo Imagng` all work. |
 | `/unselect <name>` | Stop watching an IPO |
 | `/list` | Watched IPOs and whether each one is out yet |
 | `/pan <PAN> [label]` | Save a PAN. You can save several, e.g. one per family member. |
 | `/pan` | List saved PANs (masked) |
 | `/pan remove <PAN or label>` | Delete a saved PAN |
-| `/status [name]` | Allotment result for every saved PAN |
+| `/status [name]` | Allotment result for every saved PAN. While the bot is still retrying "no record yet" PANs, this counts as a retry. |
 | `/portfolio` | IPOs whose allotment is out, with each PAN's result. An IPO moves here from `/list` once every PAN has a result. |
 | `/portfolio remove <name>` | Delete an IPO from the portfolio |
 | `/check` | Poll the registrars right now |
